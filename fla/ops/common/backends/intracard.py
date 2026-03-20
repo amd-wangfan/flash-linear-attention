@@ -3,7 +3,9 @@
 Accelerates prefill by splitting long sequences into sub-sequences
 and processing them in parallel across SMs.
 
-Only active under torch.inference_mode() with varlen (cu_seqlens != None).
+Now active for:
+1. Inference mode with varlen (cu_seqlens != None) - original behavior
+2. Non-varlen mode with long sequences (T >= threshold) - new optimization
 """
 
 from __future__ import annotations
@@ -17,6 +19,11 @@ from fla.ops.backends import BaseBackend
 # Maximum number of sub-sequences per original sequence
 # Limits merge chain depth to control precision loss
 MAX_SUBSEQS = int(os.environ.get('FLA_INTRACARD_MAX_SPLITS', 32))
+
+# Minimum sequence length to enable intracard parallelism for non-varlen mode
+# Below this threshold, the overhead of splitting/merging outweighs the benefit
+# Benchmarking shows CP hurts at T=16384 (-9%) but helps at T>=32768 (+7-23%)
+MIN_SEQ_LEN_FOR_SPLIT = int(os.environ.get('FLA_INTRACARD_MIN_SEQ_LEN', 32768))
 
 
 class IntraCardCPBackend(BaseBackend):
@@ -48,15 +55,19 @@ class IntraCardCPBackend(BaseBackend):
         transpose_state_layout: bool = False,
     ) -> tuple[bool, str | None]:
         """Check if intracard CP should handle this call."""
-        # Only in inference mode
-        if not torch.is_inference_mode_enabled():
-            return False, "Not in inference mode"
+        # Case 1: Inference mode with varlen (original behavior)
+        if torch.is_inference_mode_enabled() and cu_seqlens is not None:
+            return True, None
 
-        # Only for varlen
+        # Case 2: Non-varlen mode with long sequences
+        # This helps both inference and forward-only training
         if cu_seqlens is None:
-            return False, "cu_seqlens is None"
+            B, T = k.shape[0], k.shape[1]
+            # Only for batch size 1 with long sequences
+            if B == 1 and T >= MIN_SEQ_LEN_FOR_SPLIT:
+                return True, None
 
-        return True, None
+        return False, "Conditions not met for intracard CP"
 
     def chunk_gated_delta_rule_fwd_h(
         self,
@@ -77,6 +88,13 @@ class IntraCardCPBackend(BaseBackend):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Intra-card CP implementation of chunk_gated_delta_rule_fwd_h."""
         from fla.ops.common.intracard_cp import intracard_fwd_h
+
+        # For non-varlen mode, create cu_seqlens to enable splitting
+        if cu_seqlens is None:
+            B, T = k.shape[0], k.shape[1]
+            # Create cu_seqlens for the single sequence
+            cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=k.device)
+            cu_seqlens_cpu = torch.tensor([0, T], dtype=torch.long)
 
         return intracard_fwd_h(
             k=k, w=w, u=u, g=g, gk=gk,

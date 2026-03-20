@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_AMD_MI325, IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
 
 if IS_NVIDIA_BLACKWELL:
     """
@@ -42,8 +42,8 @@ else:
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([4, 8, 16] if IS_AMD_MI325 else [2, 4, 8])
+        for num_stages in ([1, 2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
     **autotune_cache_kwargs,
@@ -113,10 +113,10 @@ def recompute_w_u_fwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([1, 2, 4] if IS_AMD_MI325 else [2, 4])
+        for num_stages in ([2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -296,7 +296,7 @@ def prepare_wy_repr_bwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    CONST_TILING = 64 if check_shared_mem() else 32
+    CONST_TILING = 32 if IS_AMD_MI325 else (64 if check_shared_mem() else 32)
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 

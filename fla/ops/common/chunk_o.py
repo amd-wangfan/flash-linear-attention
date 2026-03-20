@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_AMD_MI325, IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
@@ -19,6 +19,14 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 })
 @triton.autotune(
     configs=[
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=16, num_stages=2),
+        triton.Config({'BK': 128, 'BV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=2),
+    ] if IS_AMD_MI325 else [
         triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),

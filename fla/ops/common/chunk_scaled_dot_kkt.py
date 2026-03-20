@@ -7,7 +7,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import autotune_cache_kwargs
+from fla.utils import IS_AMD_MI325, autotune_cache_kwargs
 
 
 @triton.heuristics({
@@ -18,8 +18,8 @@ from fla.utils import autotune_cache_kwargs
     configs=[
         triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([4, 8, 16] if IS_AMD_MI325 else [2, 4, 8])
+        for num_stages in ([1, 2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
     key=['H', 'K', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,

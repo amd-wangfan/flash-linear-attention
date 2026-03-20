@@ -19,7 +19,7 @@ import triton
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
-from fla.utils import get_multiprocessor_count
+from fla.utils import get_multiprocessor_count, IS_AMD_MI325
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +146,18 @@ def compute_subseq_len(
     # Target splits: saturate SMs with the longest sequence alone.
     # Each sub-seq contributes NUM_V_BLOCKS * num_heads blocks.
     # Always at least 4 — for linear recurrence, CP4 always helps.
-    NUM_V_BLOCKS = 2
+    # For MI325X, use more aggressive splitting to better utilize 304 CUs
+    NUM_V_BLOCKS = 1 if IS_AMD_MI325 else 2
     target_splits = max(4, num_sms // (NUM_V_BLOCKS * num_heads))
 
     subseq_chunks = (seq_chunks + target_splits - 1) // target_splits
 
     # Floor: prevent subseq_len from being too small.
-    # With chunk_size=64, MIN_SUBSEQ_CHUNKS=128 → subseq_len >= 8192 tokens,
+    # For MI325X (304 CUs), MIN_SUBSEQ_CHUNKS=64 → subseq_len >= 4096 tokens,
+    # giving 8 splits at T=32768 (benchmarked as optimal split count).
+    # For other GPUs, MIN_SUBSEQ_CHUNKS=128 → subseq_len >= 8192 tokens,
     # split threshold (3 * subseq_len) = 24576 tokens.
-    # Sequences shorter than it won't be split.
-    MIN_SUBSEQ_CHUNKS = 128
+    MIN_SUBSEQ_CHUNKS = 64 if IS_AMD_MI325 else 128
     subseq_chunks = max(subseq_chunks, MIN_SUBSEQ_CHUNKS)
 
     return subseq_chunks * chunk_size

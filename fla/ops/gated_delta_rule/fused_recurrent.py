@@ -5,8 +5,16 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.modules.l2norm import l2norm_fwd
 from fla.ops.utils.op import exp
-from fla.utils import input_guard
+from fla.utils import IS_AMD, autotune_cache_kwargs, input_guard
+
+FUSED_RECURRENT_GATED_DELTA_RULE_NUM_WARPS = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8]
+FUSED_RECURRENT_GATED_DELTA_RULE_NUM_STAGES = [1, 2, 3] if IS_AMD else [2, 3, 4]
+FUSED_RECURRENT_GATED_DELTA_RULE_BV = [8, 16, 32, 64] if IS_AMD else [8, 16]
+MI325_FAST_GATED_DELTA_NUM_WARPS = [4, 8, 16]
+MI325_FAST_GATED_DELTA_NUM_STAGES = [1, 2]
+MI325_FAST_GATED_DELTA_BV = [32, 64]
 
 
 @triton.heuristics({
@@ -17,6 +25,20 @@ from fla.utils import input_guard
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in FUSED_RECURRENT_GATED_DELTA_RULE_BV
+        for num_warps in FUSED_RECURRENT_GATED_DELTA_RULE_NUM_WARPS
+        for num_stages in FUSED_RECURRENT_GATED_DELTA_RULE_NUM_STAGES
+    ],
+    key=[
+        'K', 'V', 'USE_G', 'USE_GK', 'USE_GV',
+        'USE_QK_L2NORM_IN_KERNEL', 'IS_BETA_HEADWISE',
+        'USE_INITIAL_STATE', 'STORE_FINAL_STATE', 'IS_VARLEN',
+    ],
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
@@ -32,6 +54,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     cu_seqlens,
     scale,
     T,
+    B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -94,7 +117,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             p_h0 = h0 + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for _ in tl.range(0, T):
+    for _ in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -112,14 +135,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_h *= exp(b_g)
 
         if USE_GK:
-            b_gk = tl.load(p_gk).to(tl.float32)
+            b_gk = tl.load(p_gk, mask=mask_k, other=0).to(tl.float32)
             if TRANSPOSE_STATE:
                 b_h *= exp(b_gk[None, :])
             else:
                 b_h *= exp(b_gk[:, None])
 
         if USE_GV:
-            b_gv = tl.load(p_gv).to(tl.float32)
+            b_gv = tl.load(p_gv, mask=mask_v, other=0).to(tl.float32)
             if TRANSPOSE_STATE:
                 b_h *= exp(b_gv[:, None])
             else:
@@ -155,6 +178,77 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in MI325_FAST_GATED_DELTA_BV
+        for num_warps in MI325_FAST_GATED_DELTA_NUM_WARPS
+        for num_stages in MI325_FAST_GATED_DELTA_NUM_STAGES
+    ],
+    key=['HV'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def fused_recurrent_gated_delta_rule_fwd_kernel_mi325_fast(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    o,
+    scale,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+):
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    o_k = tl.arange(0, 128)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_v = o_v < V
+
+    bos = i_n * T
+    p_q = q + (bos * H + i_h) * 128 + o_k
+    p_k = k + (bos * H + i_h) * 128 + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_g = g + bos * HV + i_hv
+    p_beta = beta + bos * HV + i_hv
+    p_o = o + (bos * HV + i_hv) * V + o_v
+
+    b_h = tl.zeros([128, BV], dtype=tl.float32)
+
+    for _ in range(0, T):
+        b_q = tl.load(p_q).to(tl.float32)
+        b_k = tl.load(p_k).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q *= scale
+
+        b_h *= exp(tl.load(p_g).to(tl.float32))
+
+        b_beta = tl.load(p_beta).to(tl.float32)
+        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], axis=0))
+        b_h += b_k[:, None] * b_v[None, :]
+
+        b_o = tl.sum(b_h * b_q[:, None], axis=0)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        p_q += H * 128
+        p_k += H * 128
+        p_v += HV * V
+        p_g += HV
+        p_beta += HV
+        p_o += HV * V
+
+
 def fused_recurrent_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -173,10 +267,41 @@ def fused_recurrent_gated_delta_rule_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
-    NV = triton.cdiv(V, BV)
 
+    use_mi325_fast_path = (
+        IS_AMD and
+        g is not None and
+        gk is None and
+        gv is None and
+        initial_state is None and
+        not output_final_state and
+        cu_seqlens is None and
+        beta.ndim != v.ndim and
+        K == 128 and
+        V == 128
+    )
+
+    if use_mi325_fast_path:
+        o = torch.empty_like(v)
+        fused_recurrent_gated_delta_rule_fwd_kernel_mi325_fast[
+            lambda meta: (triton.cdiv(V, meta['BV']), N * HV)
+        ](
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            o=o,
+            scale=scale,
+            T=T,
+            H=H,
+            HV=HV,
+            V=V,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        )
+        return o, None
+
+    BK = triton.next_power_of_2(K)
     o = torch.empty_like(v)
     if output_final_state:
         if transpose_state_layout:
@@ -186,7 +311,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     else:
         final_state = None
 
-    grid = (NV, N * HV)
+    def grid(meta): return (triton.cdiv(V, meta['BV']), N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
@@ -201,17 +326,15 @@ def fused_recurrent_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
+        B=B,
         H=H,
         HV=HV,
         K=K,
         V=V,
         BK=BK,
-        BV=BV,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         TRANSPOSE_STATE=transpose_state_layout,
-        num_warps=1,
-        num_stages=3,
     )
     return o, final_state
 
@@ -236,6 +359,11 @@ class FusedRecurrentFunction(torch.autograd.Function):
         cu_seqlens: torch.LongTensor | None = None,
         transpose_state_layout: bool = False,
     ):
+        if use_qk_l2norm_in_kernel:
+            q, _ = l2norm_fwd(q)
+            k, _ = l2norm_fwd(k)
+            use_qk_l2norm_in_kernel = False
+
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -380,3 +508,4 @@ def fused_recurrent_gated_delta_rule(
         transpose_state_layout,
     )
     return o, final_state
+

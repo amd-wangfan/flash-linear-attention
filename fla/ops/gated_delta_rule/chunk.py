@@ -99,7 +99,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         transpose_state_layout=transpose_state_layout,
     )
-    return g, o, A, final_state, initial_state
+    # Cache h, v_new, and w for backward pass to avoid recomputation
+    return g, o, A, final_state, initial_state, h, v_new, w
 
 
 def chunk_gated_delta_rule_bwd(
@@ -117,31 +118,54 @@ def chunk_gated_delta_rule_bwd(
     cp_context: FLACPContext | None = None,
     chunk_indices: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
+    h: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
+    w: torch.Tensor | None = None,
 ):
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    # Use cached w, h, v_new if available, otherwise recompute
+    if w is None:
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
-    if cp_context is not None:
-        initial_state = expand_h0(initial_state, context=cp_context)
+    if h is None or v_new is None:
+        if cp_context is not None:
+            initial_state = expand_h0(initial_state, context=cp_context)
 
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
-    )
+        # Need u for recomputation if not cached
+        if 'u' not in dir() or u is None:
+            _, u = recompute_w_u_fwd(
+                k=k,
+                v=v,
+                beta=beta,
+                A=A,
+                g=g,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
+
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+    else:
+        # When using cached states, still need to expand h0 for cp_context
+        if cp_context is not None:
+            initial_state = expand_h0(initial_state, context=cp_context)
+
     dv = chunk_bwd_dv_local(
         q=q,
         k=k,
@@ -244,7 +268,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
-        g, o, A, final_state, initial_state = chunk_gated_delta_rule_fwd(
+        g, o, A, final_state, initial_state, h, v_new, w = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -258,7 +282,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             transpose_state_layout=transpose_state_layout,
         )
-        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices)
+        # Cache h, v_new, w, and chunk_indices for backward pass
+        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices, h, v_new, w)
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.cp_context = cp_context
@@ -273,7 +298,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices = ctx.saved_tensors
+        q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices, h, v_new, w = ctx.saved_tensors
         dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
             q=q,
             k=k,
@@ -289,6 +314,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cp_context=ctx.cp_context,
             chunk_indices=chunk_indices,
             transpose_state_layout=ctx.transpose_state_layout,
+            h=h,
+            v_new=v_new,
+            w=w,
         )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
