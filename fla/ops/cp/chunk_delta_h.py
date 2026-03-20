@@ -16,7 +16,7 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
-from fla.utils import USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_AMD_MI325, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
 if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
@@ -31,8 +31,8 @@ if TYPE_CHECKING:
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([4, 8, 16] if IS_AMD_MI325 else [2, 4])
+        for num_stages in ([1, 2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
     key=['H', 'HV', 'K', 'V', 'BT'],
     use_cuda_graph=USE_CUDA_GRAPH,
@@ -310,8 +310,8 @@ def pre_process_fwd_kernel_merged(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
+        for num_stages in ([1, 2] if IS_AMD_MI325 else [2, 3, 4])
+        for BV in ([32, 64] if IS_AMD_MI325 else [32, 64])
     ],
     key=['HV', 'K', 'V', 'BT'],
     use_cuda_graph=USE_CUDA_GRAPH,

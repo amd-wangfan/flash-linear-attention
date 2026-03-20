@@ -11,8 +11,34 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
-from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, check_shared_mem
+from fla.ops.utils.op import exp, exp2
+from fla.utils import IS_AMD_MI325, IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
+
+if IS_NVIDIA_BLACKWELL:
+    """
+    Compute tl.dot with SM100 workaround.
+
+    On SM100 (Blackwell) GPUs, wraps the result in inline assembly to prevent
+    the TritonGPUHoistTMEMAlloc pass from incorrectly fusing add and dot operations.
+    See: https://github.com/fla-org/flash-linear-attention/issues/638
+
+    TODO: Remove this workaround once the Triton compiler bug is fixed.
+    Track upstream issue at: https://github.com/triton-lang/triton/issues/8695
+    """
+    @triton.jit
+    def safe_dot(a, b):
+        return tl.inline_asm_elementwise(
+            asm="mov.f32 $0, $1;",
+            constraints="=r,r",
+            args=[tl.dot(a, b)],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+else:
+    @triton.jit
+    def safe_dot(a, b):
+        return tl.dot(a, b)
 
 
 @triton.heuristics({
@@ -22,8 +48,8 @@ from fla.utils import autotune_cache_kwargs, check_shared_mem
 @fla_cache_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([4, 8, 16] if IS_AMD_MI325 else [2, 4, 8])
+        for num_stages in ([1, 2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
     **autotune_cache_kwargs,
@@ -94,10 +120,10 @@ def recompute_w_u_fwd_kernel(
 @fla_cache_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
+        for num_warps in ([1, 2, 4] if IS_AMD_MI325 else [2, 4])
+        for num_stages in ([2, 3] if IS_AMD_MI325 else [2, 3, 4])
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -282,7 +308,7 @@ def prepare_wy_repr_bwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    CONST_TILING = 64 if check_shared_mem() else 32
+    CONST_TILING = 32 if IS_AMD_MI325 else (64 if check_shared_mem() else 32)
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 
